@@ -1,0 +1,557 @@
+Codes
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize_scalar
+from shapely.geometry import Polygon, Point, MultiPolygon, MultiPoint
+from shapely.affinity import scale
+from shapely.ops import unary_union
+import smallestenclosingcircle as mec  # Minimal Enclosing Circle
+
+# Function to compute the Minkowski sum of two convex polygons
+def minkowski_sum_convex(poly1, poly2):
+    """
+    Compute the Minkowski sum of two convex polygons using Shapely.
+    """
+    if poly1.is_empty or poly2.is_empty:
+        return Polygon()
+    # Extract coordinates
+    p1_coords = np.array(poly1.exterior.coords)
+    p2_coords = np.array(poly2.exterior.coords)
+    # Compute all pairwise sums
+    combined_points = []
+    for x, y in p1_coords:
+        for xx, yy in p2_coords:
+            combined_points.append((x + xx, y + yy))
+    # Compute the convex hull of the combined points
+    hull = MultiPoint(combined_points).convex_hull
+    return hull
+
+# Function to compute the Minkowski difference A ⊖ B
+def minkowski_difference(A, B, num_dirs=720):
+    """
+    Compute the Minkowski difference A ⊖ B by intersecting half-spaces.
+    """
+    thetas = np.linspace(0, 2 * np.pi, num_dirs, endpoint=False)
+    bound = 1e5  # A large number to approximate infinity
+    C = Polygon([(-bound, -bound), (bound, -bound), (bound, bound), (-bound, bound)])
+    
+    for theta in thetas:
+        u = np.array([np.cos(theta), np.sin(theta)])
+        # Support functions
+        h_A = max(np.dot(coord, u) for coord in A.exterior.coords)
+        h_B = max(np.dot(coord, u) for coord in B.exterior.coords)
+        dist = max(0.0, h_A - h_B)
+        # Define the half-space
+        perp = np.array([-u[1], u[0]])
+        p1 = dist * u + perp * bound
+        p2 = dist * u - perp * bound
+        far_point = -u * bound
+        halfspace = Polygon([tuple(p1), tuple(p2), tuple(far_point)])
+        # Intersection
+        C = C.intersection(halfspace)
+        if C.is_empty:
+            break
+    return C
+
+# Function to compute the largest inscribed circle (B_in) within a polygon
+def largest_inscribed_circle(poly, grid_resolution=500):
+    """
+    Approximate the largest inscribed circle within a polygon using grid search.
+    
+    Parameters:
+    - poly: Shapely Polygon
+    - grid_resolution: Number of points along each axis for the grid
+    
+    Returns:
+    - center: Tuple (x, y) of the circle's center
+    - radius: Radius of the circle
+    """
+    minx, miny, maxx, maxy = poly.bounds
+    x = np.linspace(minx, maxx, grid_resolution)
+    y = np.linspace(miny, maxy, grid_resolution)
+    xv, yv = np.meshgrid(x, y)
+    xv_flat = xv.flatten()
+    yv_flat = yv.flatten()
+    points = np.vstack((xv_flat, yv_flat)).T
+    # Filter points inside the polygon
+    mask = np.array([poly.contains(Point(p)) for p in points])
+    inside_points = points[mask]
+    # Compute distance to the boundary for each inside point
+    distances = np.array([poly.exterior.distance(Point(p)) for p in inside_points])
+    if len(distances) == 0:
+        return None, 0
+    max_idx = np.argmax(distances)
+    center = tuple(inside_points[max_idx])
+    radius = distances[max_idx]
+    return center, radius
+
+# Function to compute the smallest circumscribed circle (B_out) around a polygon
+def smallest_enclosing_circle(poly):
+    """
+    Compute the smallest circumscribed circle around a polygon using the smallestenclosingcircle library.
+    
+    Parameters:
+    - poly: Shapely Polygon
+    
+    Returns:
+    - center: Tuple (x, y) of the circle's center
+    - radius: Radius of the circle
+    """
+    points = list(poly.exterior.coords)
+    # Convert to list of (x, y) tuples
+    points = [tuple(p) for p in points]
+    circle = mec.make_circle(points)
+    if circle is None:
+        return None, 0
+    center_x, center_y, radius = circle
+    center = (center_x, center_y)
+    return center, radius
+
+# Function to plot a circle given center and radius
+def plot_circle(ax, center, radius, color='black', linestyle='--', label=None):
+    """
+    Plot a circle on the given Axes.
+    
+    Parameters:
+    - ax: Matplotlib Axes
+    - center: Tuple (x, y)
+    - radius: Float
+    - color: Color of the circle
+    - linestyle: Line style
+    - label: Label for the plot
+    """
+    circle = plt.Circle(center, radius, color=color, fill=False, linestyle=linestyle, label=label)
+    ax.add_artist(circle)
+
+# Define Polygon A (Pentagon)
+A_coords = [(0, 0), (4, 0), (6, 2), (3, 4), (1, 2)]
+A_poly = Polygon(A_coords).convex_hull  # Ensure convexity
+
+# Define Polygon B (Square)
+B_coords = [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)]
+B_poly = Polygon(B_coords).convex_hull  # Ensure convexity
+
+# Compute Minkowski Difference X = A ⊖ B
+X = minkowski_difference(A_poly, B_poly, num_dirs=720)
+
+# Compute Largest Inscribed Circle (B_in) within X
+center_in, radius_in = largest_inscribed_circle(X, grid_resolution=500)
+
+# Compute Smallest Enclosing Circle (B_out) around X
+center_out, radius_out = smallest_enclosing_circle(X)
+
+# Compute B_in + B and B_out + B
+if center_in and radius_in > 0:
+    B_in_poly = Point(center_in).buffer(radius_in, resolution=256)
+    B_in_plus_B = minkowski_sum_convex(B_poly, B_in_poly)
+else:
+    B_in_plus_B = Polygon()
+
+if center_out and radius_out > 0:
+    B_out_poly = Point(center_out).buffer(radius_out, resolution=256)
+    B_out_plus_B = minkowski_sum_convex(B_poly, B_out_poly)
+else:
+    B_out_plus_B = Polygon()
+
+# Compute Minkowski Sum C + B (A⊖B + B)
+C_plus_B = minkowski_sum_convex(X, B_poly)
+
+# Function to compute Hausdorff distance between A and B + sX
+def hausdorff_distance_func(s):
+    """
+    Compute the Hausdorff distance between A and B + sX.
+    
+    Parameters:
+    - s: Scaling factor (float)
+    
+    Returns:
+    - Hausdorff distance (float)
+    """
+    if s <= 0:
+        return float('inf')  # Invalid scaling
+    # Scale X by s
+    scaled_X = scale(X, xfact=s, yfact=s, origin='centroid')
+    # Compute B + sX
+    scaled_C_plus_B = minkowski_sum_convex(scaled_X, B_poly)
+    # Compute Hausdorff distance using Shapely's method
+    return A_poly.hausdorff_distance(scaled_C_plus_B)
+
+# Compute Areas for Scaling Bounds
+def compute_area(poly):
+    """
+    Compute the area of a Shapely polygon.
+    """
+    return poly.area
+
+Vol_X = compute_area(X)
+Vol_B_in = np.pi * radius_in**2 if radius_in > 0 else 0
+Vol_B_out = np.pi * radius_out**2 if radius_out > 0 else 0
+
+# Compute bounds for scaling factor s based on areas
+if Vol_X > 0 and Vol_B_in > 0 and Vol_B_out > 0:
+    lower_bound = np.sqrt(Vol_B_in / Vol_X)
+    upper_bound = np.sqrt(Vol_B_out / Vol_X)
+else:
+    lower_bound = 0
+    upper_bound = 2  # Arbitrary upper bound if areas are not positive
+
+print(f"Lower bound for s: {lower_bound:.4f}")
+print(f"Upper bound for s: {upper_bound:.4f}")
+
+# Optimize scaling factor s to minimize Hausdorff distance within bounds
+result = minimize_scalar(hausdorff_distance_func, bounds=(lower_bound, upper_bound), method='bounded')
+optimal_s = result.x
+min_hausdorff = result.fun
+
+print(f"Optimal scaling factor s: {optimal_s:.4f}")
+print(f"Minimum Hausdorff Distance: {min_hausdorff:.4f}")
+
+# Compute B + sX
+scaled_X_opt = scale(X, xfact=optimal_s, yfact=optimal_s, origin='centroid')
+scaled_C_plus_B_opt = minkowski_sum_convex(scaled_X_opt, B_poly)
+
+# Plotting
+fig, ax = plt.subplots(figsize=(12, 12))
+
+# Plot Polygon A
+Ax, Ay = A_poly.exterior.xy
+ax.plot(Ax, Ay, 'r-', label='A (Pentagon)')
+
+# Plot Polygon B
+Bx, By = B_poly.exterior.xy
+ax.plot(Bx, By, 'g-', label='B (Square)')
+
+# Plot Minkowski Difference X = A ⊖ B
+if not X.is_empty:
+    if X.geom_type == 'Polygon':
+        Cx, Cy = X.exterior.xy
+        ax.plot(Cx, Cy, 'b-', label='X = A⊖B')
+    elif X.geom_type == 'MultiPolygon':
+        for idx, poly in enumerate(X):
+            Cx, Cy = poly.exterior.xy
+            ax.plot(Cx, Cy, 'b-', label=f'X = A⊖B (MultiPolygon {idx+1})')
+else:
+    ax.plot(0, 0, 'bo', label='X = A⊖B is empty')
+
+# Plot B_in (Largest Inscribed Circle)
+if center_in and radius_in > 0:
+    plot_circle(ax, center_in, radius_in, color='yellow', linestyle='--', label='B_in (Largest Inscribed Ball)')
+else:
+    ax.plot(0, 0, 'yo', label='B_in is undefined')
+
+# Plot B_out (Smallest Circumscribed Circle)
+if center_out and radius_out > 0:
+    plot_circle(ax, center_out, radius_out, color='black', linestyle='--', label='B_out (Smallest Circumscribed Ball)')
+else:
+    ax.plot(0, 0, 'ko', label='B_out is undefined')
+
+# Plot B_in + B
+if not B_in_plus_B.is_empty:
+    if B_in_plus_B.geom_type == 'Polygon':
+        B_in_pBx, B_in_pBy = B_in_plus_B.exterior.xy
+        ax.plot(B_in_pBx, B_in_pBy, 'orange', linestyle='--', label='B_in + B')
+    elif B_in_plus_B.geom_type == 'MultiPolygon':
+        for idx, poly in enumerate(B_in_plus_B):
+            B_in_pBx, B_in_pBy = poly.exterior.xy
+            ax.plot(B_in_pBx, B_in_pBy, 'orange', linestyle='--', label=f'B_in + B (MultiPolygon {idx+1})')
+else:
+    ax.plot(0, 0, 'o', color='orange', linestyle='--', label='B_in + B is degenerate')
+
+# Plot B_out + B
+if not B_out_plus_B.is_empty:
+    if B_out_plus_B.geom_type == 'Polygon':
+        B_out_pBx, B_out_pBy = B_out_plus_B.exterior.xy
+        ax.plot(B_out_pBx, B_out_pBy, 'purple', linestyle='--', label='B_out + B')
+    elif B_out_plus_B.geom_type == 'MultiPolygon':
+        for idx, poly in enumerate(B_out_plus_B):
+            B_out_pBx, B_out_pBy = poly.exterior.xy
+            ax.plot(B_out_pBx, B_out_pBy, 'purple', linestyle='--', label=f'B_out + B (MultiPolygon {idx+1})')
+else:
+    ax.plot(0, 0, 'o', color='purple', linestyle='--', label='B_out + B is degenerate')
+
+# Plot Minkowski Sum C + B = (A⊖B) + B
+if not C_plus_B.is_empty:
+    if C_plus_B.geom_type == 'Polygon':
+        Cpbx, Cpby = C_plus_B.exterior.xy
+        ax.plot(Cpbx, Cpby, 'c--', label='B + (A⊖B) (No Scaling)')
+    elif C_plus_B.geom_type == 'MultiPolygon':
+        for idx, poly in enumerate(C_plus_B):
+            Cpbx, Cpby = poly.exterior.xy
+            ax.plot(Cpbx, Cpby, 'c--', label=f'B + (A⊖B) (MultiPolygon {idx+1})')
+else:
+    ax.plot(0, 0, 'c--', label='B + (A⊖B) is degenerate')
+
+# Plot Minkowski Sum B + sX (Optimal Scaling)
+if not scaled_C_plus_B_opt.is_empty:
+    if scaled_C_plus_B_opt.geom_type == 'Polygon':
+        Cpbx_opt, Cpby_opt = scaled_C_plus_B_opt.exterior.xy
+        ax.plot(Cpbx_opt, Cpby_opt, 'm--', label=f'B + sX (s={optimal_s:.2f})')
+    elif scaled_C_plus_B_opt.geom_type == 'MultiPolygon':
+        for idx, poly in enumerate(scaled_C_plus_B_opt):
+            Cpbx_opt, Cpby_opt = poly.exterior.xy
+            ax.plot(Cpbx_opt, Cpby_opt, 'm--', label=f'B + sX (MultiPolygon {idx+1}, s={optimal_s:.2f})')
+else:
+    ax.plot(0, 0, 'mo', label='B + sX is degenerate')
+
+# Configure Plot
+ax.set_aspect('equal', 'box')
+ax.set_title('Polygons A, B, X=A⊖B, B_in, B_out, B_in+B, B_out+B, B+(A⊖B), and B+sX')
+ax.legend(loc='upper left', bbox_to_anchor=(1.05, 1), borderaxespad=0.)
+plt.xlabel('X-axis')
+plt.ylabel('Y-axis')
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# ----- Plotting Hausdorff Distance vs Scaling Factor -----
+
+# Define Hausdorff distance without scaling for comparison
+hausdorff_dist_no_scaling = A_poly.hausdorff_distance(C_plus_B)
+
+# Generate a range of scaling factors from lower_bound to upper_bound
+s_values = np.linspace(lower_bound, upper_bound, 100)
+hausdorff_distances = []
+
+print(f"Computing Hausdorff distances for scaling factors from {lower_bound:.4f} to {upper_bound:.4f}...")
+
+for s in s_values:
+    d = hausdorff_distance_func(s)
+    hausdorff_distances.append(d)
+
+# Plot Hausdorff Distance vs Scaling Factor s
+fig, ax = plt.subplots(figsize=(10, 6))
+ax.plot(s_values, hausdorff_distances, 'b-', label='Hausdorff Distance')
+ax.axvline(x=optimal_s, color='r', linestyle='--', label=f'Optimal s = {optimal_s:.4f}')
+ax.set_xlabel('Scaling Factor s')
+ax.set_ylabel('Hausdorff Distance')
+ax.set_title('Hausdorff Distance Between A and B + sX vs Scaling Factor s')
+ax.legend()
+ax.grid(True)
+plt.show()
+
+
+hull = MultiPoint(combined_points).convex_hull
+
+https://economics-projects.slack.com/files/U083A5DTS4W/F0859MTPLFN/best_shift.ipynb
+
+import numpy as np
+import matplotlib.pyplot as plt
+from shapely.geometry import Point, Polygon, MultiPoint
+from shapely.ops import unary_union
+from scipy.optimize import minimize
+import math
+
+def minkowski_sum_polygon_polygon(polygon1, polygon2):
+    """
+    Compute the Minkowski sum of two convex polygons.
+    """
+    if not isinstance(polygon1, Polygon) or not isinstance(polygon2, Polygon):
+        raise TypeError("Both inputs must be Shapely Polygon objects.")
+    
+    # Extract coordinates, excluding the repeated last point
+    coords1 = list(polygon1.exterior.coords)[:-1]
+    coords2 = list(polygon2.exterior.coords)[:-1]
+    
+    # Compute all pairwise sums
+    sum_points = []
+    for x1, y1 in coords1:
+        for x2, y2 in coords2:
+            sum_points.append((x1 + x2, y1 + y2))
+    
+    # Create a MultiPoint object and compute the convex hull
+    return MultiPoint(sum_points).convex_hull
+
+def create_regular_polygon(radii, m):
+    """
+    Create a regular convex polygon with m vertices and specified radii.
+    Each vertex is placed at an angle equally spaced around the circle.
+    """
+    angles = np.linspace(0, 2 * np.pi, m, endpoint=False)
+    vertices = [(radii[i] * math.cos(theta), radii[i] * math.sin(theta)) for i, theta in enumerate(angles)]
+    return Polygon(vertices)
+
+def hausdorff_distance(polygon1, polygon2):
+    """
+    Compute the Hausdorff distance between two polygons.
+    """
+    return polygon1.hausdorff_distance(polygon2)
+
+# Define Circle A with radius 1, centered at origin
+A = Point(0, 0).buffer(1, resolution=256)  # High resolution for smoothness
+
+# Define Square B with side length 1.6, centered at origin
+half_side = 1.5 / 2
+B_vertices = [
+    (-half_side, -half_side),
+    (-half_side, half_side),
+    (half_side, half_side),
+    (half_side, -half_side)
+]
+B = Polygon(B_vertices)
+
+# Compute and print the initial Hausdorff distance between A and B
+initial_d_H = hausdorff_distance(A, B)
+print(f"Initial Hausdorff Distance between Circle A and Square B: {initial_d_H:.4f}")
+
+# Parameters for optimization
+m_max = 50  # Maximum number of vertices to consider
+m_results = []  # To store results for each m
+
+for m in range(3, m_max + 1):
+    print(f"\nOptimizing for m = {m} vertices...")
+    
+    # Define the objective function
+    def objective(radii):
+        """
+        Objective function to minimize: Hausdorff distance between A and B + X(radii)
+        where X(radii) is a regular polygon with m vertices and radii defined by 'radii'.
+        """
+        # Create polygon X_m
+        X_m = create_regular_polygon(radii, m)
+        
+        # Compute Minkowski sum B + X_m
+        mink_sum = minkowski_sum_polygon_polygon(B, X_m)
+        
+        # Compute Hausdorff distance between A and B + X_m
+        d_H = hausdorff_distance(A, mink_sum)
+        return d_H
+
+    # Initial guess for radii
+    initial_radii = np.full(m, 0.5)  # Starting with radii = 0.5
+
+    # Bounds for radii to ensure they are positive and within a reasonable range
+    bounds = [(0.1, 2.0) for _ in range(m)]
+
+    # Perform optimization using L-BFGS-B algorithm
+    result = minimize(objective, initial_radii, method='L-BFGS-B', bounds=bounds)
+
+    if result.success:
+        optimal_radii = result.x
+        min_d_H = result.fun
+        print(f"Optimization successful for m = {m}.")
+        print(f"Optimal Radii: {optimal_radii}")
+        print(f"Minimum Hausdorff Distance: {min_d_H:.4f}")
+    else:
+        print(f"Optimization failed for m = {m}. Using initial radii.")
+        optimal_radii = initial_radii
+        min_d_H = objective(optimal_radii)
+        print(f"Minimum Hausdorff Distance with initial radii: {min_d_H:.4f}")
+
+    # Store the results
+    m_results.append({
+        'm': m,
+        'radii': optimal_radii,
+        'D_H': min_d_H
+    })
+
+# Identify the best m with the smallest Hausdorff distance
+best_result = min(m_results, key=lambda x: x['D_H'])
+best_m = best_result['m']
+best_radii = best_result['radii']
+best_D_H = best_result['D_H']
+
+print(f"\nBest m: {best_m} with Minimum Hausdorff Distance: {best_D_H:.4f}")
+
+# Ensure that D_H(A, B + X_m) < D_H(A, B)
+if best_D_H < initial_d_H:
+    print(f"Success: The optimized Hausdorff distance {best_D_H:.4f} is smaller than the initial distance {initial_d_H:.4f}.")
+else:
+    print(f"Warning: The optimized Hausdorff distance {best_D_H:.4f} is not smaller than the initial distance {initial_d_H:.4f}.")
+
+# Create the optimal polygon X for the best m
+X_best = create_regular_polygon(best_radii, best_m)
+
+# Compute Minkowski sum B + X_best
+mink_sum_best = minkowski_sum_polygon_polygon(B, X_best)
+
+# Plotting Function
+def plot_results(A, B, mink_sum, X_m, m):
+    """
+    Plot the original shapes, Minkowski sum, and the optimized polygon X_m.
+    """
+    fig, ax = plt.subplots(figsize=(8, 8))
+    
+    # Plot Circle A
+    x_A, y_A = A.exterior.xy
+    ax.plot(x_A, y_A, color='blue', label='Circle A (Radius=1)')
+    
+    # Plot Square B
+    x_B, y_B = B.exterior.xy
+    ax.plot(x_B, y_B, color='green', label='Square B (Side=1.6)')
+    
+    # Plot Minkowski Sum B + X_m
+    if not mink_sum.is_empty:
+        if mink_sum.geom_type == 'Polygon':
+            x_sum, y_sum = mink_sum.exterior.xy
+            ax.plot(x_sum, y_sum, color='red', linestyle='--', label=f'Minkowski Sum B + X_{m}')
+        elif mink_sum.geom_type == 'MultiPolygon':
+            for poly in mink_sum.geoms:
+                x_sum, y_sum = poly.exterior.xy
+                ax.plot(x_sum, y_sum, color='red', linestyle='--', label=f'Minkowski Sum B + X_{m}')
+    
+    # Plot Optimized Polygon X_m
+    if not X_m.is_empty:
+        x_X, y_X = X_m.exterior.xy
+        ax.plot(x_X, y_X, color='purple', linestyle='-.', label=f'Optimized Polygon X_{m}')
+    
+    # Formatting the plot
+    ax.set_aspect('equal', 'box')
+    ax.set_title(f'Optimization Result for m = {m}')
+    ax.legend()
+    ax.grid(True)
+    
+    plt.show()
+
+# Plot the best result
+plot_results(A, B, mink_sum_best, X_best, best_m)
+
+# Optionally, plot all results for comparison
+def plot_all_results(m_results, A, B):
+    """
+    Plot all optimization results for different m values.
+    """
+    fig, ax = plt.subplots(figsize=(10, 10))
+    
+    # Plot Circle A
+    x_A, y_A = A.exterior.xy
+    ax.plot(x_A, y_A, color='blue', label='Circle A (Radius=1)')
+    
+    # Plot Square B
+    x_B, y_B = B.exterior.xy
+    ax.plot(x_B, y_B, color='green', label='Square B (Side=1.6)')
+    
+    colors = plt.cm.viridis(np.linspace(0, 1, len(m_results)))
+    
+    for idx, result in enumerate(m_results):
+        m = result['m']
+        D_H = result['D_H']
+        radii = result['radii']
+        X_m = create_regular_polygon(radii, m)
+        mink_sum = minkowski_sum_polygon_polygon(B, X_m)
+        
+        if not mink_sum.is_empty:
+            if mink_sum.geom_type == 'Polygon':
+                x_sum, y_sum = mink_sum.exterior.xy
+                ax.plot(x_sum, y_sum, color=colors[idx], linestyle='--', label=f'm={m}, D_H={D_H:.4f}')
+            elif mink_sum.geom_type == 'MultiPolygon':
+                for poly in mink_sum.geoms:
+                    x_sum, y_sum = poly.exterior.xy
+                    ax.plot(x_sum, y_sum, color=colors[idx], linestyle='--', label=f'm={m}, D_H={D_H:.4f}')
+        
+        # Plot X_m
+        if not X_m.is_empty:
+            x_X, y_X = X_m.exterior.xy
+            ax.plot(x_X, y_X, color=colors[idx], linestyle='-.', label=f'X_{m}')
+    
+    # Formatting the plot
+    ax.set_aspect('equal', 'box')
+    ax.set_title('Optimization Results for Different m Values')
+    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    ax.grid(True)
+    
+    plt.tight_layout()
+    plt.show()
+
+# Uncomment the following line to plot all results
+# plot_all_results(m_results, A, B)
+
